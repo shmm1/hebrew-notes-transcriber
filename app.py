@@ -55,8 +55,8 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
 CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "high")
 
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
-# "gemini-flash-latest" is Google's alias for the newest Flash model (has a free tier).
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+# gemini-4-hydrogen has a free tier; gemini-4-argon is the stronger, paid-only model.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen")
 
 PROVIDER_LABELS = {"gemini": "Gemini", "claude": "Claude"}
 PROVIDERS = [p for p, key in (("gemini", GEMINI_API_KEY), ("claude", ANTHROPIC_API_KEY)) if key]
@@ -243,17 +243,37 @@ def get_gemini() -> genai.Client:
 _GEMINI_BLOCKED = {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "IMAGE_SAFETY", "OTHER"}
 
 
+async def available_gemini_models() -> list[str]:
+    """Model IDs this API key can use for generateContent (for helpful errors)."""
+    names = []
+    try:
+        async for model in await get_gemini().aio.models.list():
+            if "generateContent" in (model.supported_actions or []) and "gemini" in (model.name or ""):
+                names.append(model.name.removeprefix("models/"))
+    except Exception:
+        pass
+    return names
+
+
 async def gemini_stream(mime: str, payload: bytes, instruction: str):
-    config = genai_types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        # Small handwriting needs the high-detail image encoding.
-        media_resolution=genai_types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+    # Small handwriting needs the high-detail encoding (set per media item on Gemini 4).
+    media = genai_types.Part.from_bytes(
+        data=payload,
+        mime_type=mime,
+        media_resolution=genai_types.PartMediaResolutionLevel.MEDIA_RESOLUTION_HIGH,
     )
-    stream = await get_gemini().aio.models.generate_content_stream(
-        model=GEMINI_MODEL,
-        contents=[genai_types.Part.from_bytes(data=payload, mime_type=mime), instruction],
-        config=config,
-    )
+    try:
+        stream = await get_gemini().aio.models.generate_content_stream(
+            model=GEMINI_MODEL,
+            contents=[media, instruction],
+            config=genai_types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        )
+    except genai_errors.ClientError as exc:
+        if exc.code == 404:
+            names = await available_gemini_models()
+            hint = f" מודלים זמינים: {', '.join(names[:12])}" if names else ""
+            raise TranscriptionError(f"המודל {GEMINI_MODEL} לא נמצא. עדכנו את GEMINI_MODEL ב-.env.{hint}") from exc
+        raise
     finish = None
     async for chunk in stream:
         feedback = chunk.prompt_feedback
