@@ -64,6 +64,11 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen")
 # Thinking depth: low / medium / high / xhigh. Higher = slower, sometimes more accurate.
 GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "medium").strip().upper()
 GEMINI_TIMEOUT_S = int(os.environ.get("GEMINI_TIMEOUT_S", "300"))
+# Tried in order when the main model is overloaded (503) or out of free quota (429).
+GEMINI_FALLBACK_MODELS = [
+    m.strip() for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite").split(",") if m.strip()
+]
+GEMINI_ATTEMPTS = int(os.environ.get("GEMINI_ATTEMPTS", "3"))  # per model
 
 PROVIDER_LABELS = {"gemini": "Gemini", "claude": "Claude"}
 PROVIDERS = [p for p, key in (("gemini", GEMINI_API_KEY), ("claude", ANTHROPIC_API_KEY)) if key]
@@ -192,6 +197,10 @@ class TranscriptionError(Exception):
     pass
 
 
+class Status(str):
+    """Progress message (not transcription text) yielded by a stream."""
+
+
 async def prepare_input(data: bytes) -> tuple[str, bytes, str]:
     """Return (mime_type, bytes, instruction) for one uploaded file."""
     if data[:5] == b"%PDF-":
@@ -256,14 +265,13 @@ async def claude_stream(mime: str, payload: bytes, instruction: str, effort: str
 # ---- Gemini
 @lru_cache(maxsize=1)
 def get_gemini() -> genai.Client:
-    retry = genai_types.HttpRetryOptions(
-        attempts=4, initial_delay=2.0, max_delay=30.0, http_status_codes=[429, 500, 502, 503, 504]
-    )
-    http = genai_types.HttpOptions(retry_options=retry, timeout=GEMINI_TIMEOUT_S * 1000)
+    # Retries are done in gemini_stream so the user sees what is happening.
+    http = genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_S * 1000)
     return genai.Client(api_key=GEMINI_API_KEY, http_options=http)
 
 
 _GEMINI_BLOCKED = {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "IMAGE_SAFETY", "OTHER"}
+_GEMINI_TRANSIENT = {429, 500, 502, 503, 504}
 
 
 async def available_gemini_models() -> list[str]:
@@ -278,6 +286,16 @@ async def available_gemini_models() -> list[str]:
     return names
 
 
+def _gemini_config(model: str, thinking: str) -> genai_types.GenerateContentConfig:
+    # Only Gemini 4 documents low/medium/high/xhigh; other models keep their default.
+    use_level = thinking and model.startswith("gemini-4")
+    return genai_types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        thinking_config=genai_types.ThinkingConfig(thinking_level=thinking) if use_level else None,
+        automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(disable=True),
+    )
+
+
 async def gemini_stream(mime: str, payload: bytes, instruction: str, thinking: str):
     # Small handwriting needs the high-detail encoding (set per media item on Gemini 4).
     media = genai_types.Part.from_bytes(
@@ -285,46 +303,60 @@ async def gemini_stream(mime: str, payload: bytes, instruction: str, thinking: s
         mime_type=mime,
         media_resolution=genai_types.PartMediaResolutionLevel.MEDIA_RESOLUTION_HIGH,
     )
-    try:
-        stream = await get_gemini().aio.models.generate_content_stream(
-            model=GEMINI_MODEL,
-            contents=[media, instruction],
-            config=genai_types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                thinking_config=(
-                    genai_types.ThinkingConfig(thinking_level=thinking) if thinking else None
-                ),
-            ),
-        )
-    except genai_errors.ClientError as exc:
-        if exc.code == 404:
-            names = await available_gemini_models()
-            hint = f" מודלים זמינים: {', '.join(names[:12])}" if names else ""
-            raise TranscriptionError(f"המודל {GEMINI_MODEL} לא נמצא. עדכנו את GEMINI_MODEL ב-.env.{hint}") from exc
-        raise
-    finish, usage = None, None
-    async for chunk in stream:
-        usage = chunk.usage_metadata or usage
-        feedback = chunk.prompt_feedback
-        if feedback and feedback.block_reason:
-            raise TranscriptionError("Gemini חסם את הבקשה")
-        if chunk.candidates and chunk.candidates[0].finish_reason:
-            finish = chunk.candidates[0].finish_reason.name
-        if chunk.text:
-            yield chunk.text
+    models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
+    last_error: Exception | None = None
 
-    if usage:
-        log.info(
-            "gemini %s thinking=%s finish=%s tokens: prompt=%s thinking=%s output=%s",
-            GEMINI_MODEL, thinking, finish, usage.prompt_token_count, usage.thoughts_token_count,
-            usage.candidates_token_count,
-        )
-    if finish == "RECITATION":
-        raise TranscriptionError("Gemini עצר באמצע (RECITATION). נסו שוב, או תמללו את הדף עם Claude")
-    if finish in _GEMINI_BLOCKED:
-        raise TranscriptionError(f"Gemini עצר את התמלול ({finish})")
-    if finish == "MAX_TOKENS":
-        yield TRUNCATED_NOTE
+    for model_index, model in enumerate(models):
+        if model_index:
+            yield Status(f"{models[model_index - 1]} עמוס. עובר ל-{model}…")
+            log.info("gemini: falling back to %s", model)
+        for attempt in range(1, GEMINI_ATTEMPTS + 1):
+            produced_text = False
+            try:
+                stream = await get_gemini().aio.models.generate_content_stream(
+                    model=model, contents=[media, instruction], config=_gemini_config(model, thinking)
+                )
+                finish, usage = None, None
+                async for chunk in stream:
+                    usage = chunk.usage_metadata or usage
+                    feedback = chunk.prompt_feedback
+                    if feedback and feedback.block_reason:
+                        raise TranscriptionError("Gemini חסם את הבקשה")
+                    if chunk.candidates and chunk.candidates[0].finish_reason:
+                        finish = chunk.candidates[0].finish_reason.name
+                    if chunk.text:
+                        produced_text = True
+                        yield chunk.text
+            except genai_errors.APIError as exc:
+                last_error = exc
+                if exc.code == 404:
+                    names = await available_gemini_models()
+                    hint = f" מודלים זמינים: {', '.join(names[:12])}" if names else ""
+                    raise TranscriptionError(f"המודל {model} לא נמצא. עדכנו את GEMINI_MODEL ב-.env.{hint}") from exc
+                if exc.code not in _GEMINI_TRANSIENT or produced_text:
+                    raise
+                log.info("gemini %s attempt %d/%d failed: %s %s", model, attempt, GEMINI_ATTEMPTS, exc.code, exc.status)
+                if attempt < GEMINI_ATTEMPTS:
+                    busy = "המכסה החינמית נוצלה" if exc.code == 429 else "Gemini עמוס כרגע"
+                    yield Status(f"{busy}, מנסה שוב ({attempt + 1}/{GEMINI_ATTEMPTS})…")
+                    await asyncio.sleep(2 * attempt + secrets.randbelow(1000) / 1000)
+                continue
+
+            if usage:
+                log.info(
+                    "gemini %s thinking=%s finish=%s tokens: prompt=%s thinking=%s output=%s",
+                    model, thinking, finish, usage.prompt_token_count, usage.thoughts_token_count,
+                    usage.candidates_token_count,
+                )
+            if finish == "RECITATION":
+                raise TranscriptionError("Gemini עצר באמצע (RECITATION). נסו שוב, או תמללו את הדף עם Claude")
+            if finish in _GEMINI_BLOCKED:
+                raise TranscriptionError(f"Gemini עצר את התמלול ({finish})")
+            if finish == "MAX_TOKENS":
+                yield TRUNCATED_NOTE
+            return
+
+    raise last_error or TranscriptionError("Gemini לא זמין כרגע")
 
 
 def friendly_error(exc: Exception) -> str:
@@ -348,6 +380,8 @@ def friendly_error(exc: Exception) -> str:
         message = exc.message or ""
         if exc.code == 429:
             return "חרגתם ממכסת Gemini (בחינם יש מגבלה לדקה וליום). נסו שוב מאוחר יותר"
+        if exc.code == 503:
+            return "Gemini עמוס כרגע (גם מודל הגיבוי). נסו שוב בעוד כמה דקות"
         if exc.code in (401, 403) or "API key" in message:
             return "מפתח ה-API של Gemini חסר או שגוי (GEMINI_API_KEY)"
         if exc.code == 404:
@@ -355,6 +389,8 @@ def friendly_error(exc: Exception) -> str:
         if exc.code and exc.code >= 500:
             return f"שגיאה בשירות של Gemini ({exc.code}) - נסו שוב"
         return f"Gemini דחה את הבקשה: {message}"
+    if "timeout" in type(exc).__name__.lower():
+        return "שירות התמלול לא ענה בזמן. נסו שוב"
     if isinstance(exc, anthropic.AnthropicError) and "auth" in str(exc).lower():
         return "מפתח ה-API של Anthropic חסר (ANTHROPIC_API_KEY)"
     return "שגיאה לא צפויה בתמלול"
@@ -469,6 +505,9 @@ async def transcribe(
                 started, first = time.monotonic(), None
                 try:
                     async for chunk in transcribe_page(data, provider, quality):
+                        if isinstance(chunk, Status):
+                            await queue.put({"type": "status", "page": index, "text": str(chunk)})
+                            continue
                         if first is None:
                             first = time.monotonic() - started
                         await queue.put({"type": "delta", "page": index, "text": chunk})

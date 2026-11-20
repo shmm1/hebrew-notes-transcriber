@@ -714,6 +714,8 @@
       r.t0 = performance.now();
       setStatus(r, "run", "קורא את הדף…");
       startTicker();
+    } else if (ev.type === "status") {
+      setStatus(r, "run", esc(ev.text));
     } else if (ev.type === "delta") {
       if (r.status !== "stream") { setStatus(r, "run", "מתמלל…"); r.status = "stream"; r.el.querySelector(".text").classList.add("streaming"); }
       r.text += ev.text;
