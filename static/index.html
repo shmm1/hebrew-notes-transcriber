@@ -188,6 +188,7 @@
   }
   .status { display: inline-flex; align-items: center; gap: 7px; }
   .status.ok { color: var(--ok); }
+  .elapsed { font-variant-numeric: tabular-nums; opacity: .7; min-width: 2.6em; }
   .status.err { color: var(--danger); }
   .spinner { width: 14px; height: 14px; border-radius: 99px; border: 2px solid var(--line-strong); border-top-color: var(--accent); animation: spin .7s linear infinite; }
   .text {
@@ -323,6 +324,14 @@
         <span>מנוע זיהוי</span>
         <div class="seg" id="engineSeg" role="group" aria-label="מנוע זיהוי"></div>
       </div>
+      <div class="engine">
+        <span>מהירות מול דיוק</span>
+        <div class="seg" id="qualitySeg" role="group" aria-label="מהירות מול דיוק">
+          <button type="button" data-q="fast" title="חשיבה קצרה. הכי מהיר">מהיר</button>
+          <button type="button" data-q="balanced" title="ברירת המחדל">מאוזן</button>
+          <button type="button" data-q="precise" title="חשיבה מעמיקה. איטי יותר, טוב לכתב קשה">מדויק</button>
+        </div>
+      </div>
       <button class="btn primary wide" id="goBtn" type="button">תמלול</button>
     </div>
 
@@ -402,6 +411,20 @@
     if (view === "login") setTimeout(() => $("username").focus(), 50);
     if (view === "app") loadConfig();
   }
+
+  // ---------------------------------------------------------- speed vs accuracy
+  state.quality = localStorage.getItem("quality") || "balanced";
+  function paintQuality() {
+    $("qualitySeg").querySelectorAll("button").forEach((b) =>
+      b.setAttribute("aria-pressed", String(b.dataset.q === state.quality)));
+  }
+  $("qualitySeg").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-q]"); if (!b) return;
+    state.quality = b.dataset.q;
+    localStorage.setItem("quality", state.quality);
+    paintQuality();
+  });
+  paintQuality();
 
   // ---------------------------------------------------------- engine (Claude / Gemini)
   state.provider = "";
@@ -634,11 +657,32 @@
     }
   }
 
+  const clock = (sec) => `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, "0")}`;
+  const elapsed = (r) => (r.t0 ? (performance.now() - r.t0) / 1000 : 0);
+
   function setStatus(r, kind, label) {
     r.status = kind;
     const s = r.el.querySelector(".status");
     s.className = "status" + (kind === "ok" ? " ok" : kind === "err" ? " err" : "");
-    s.innerHTML = kind === "run" ? `<span class="spinner"></span><span>${label}</span>` : `<span>${label}</span>`;
+    s.innerHTML = kind === "run"
+      ? `<span class="spinner"></span><span>${label}</span><span class="elapsed">${clock(elapsed(r))}</span>`
+      : `<span>${label}</span>`;
+  }
+
+  // one ticker updates the elapsed time of every page still running
+  let ticker = 0;
+  function startTicker() {
+    if (ticker) return;
+    ticker = setInterval(() => {
+      let running = false;
+      for (const r of state.results) {
+        if (r.status !== "run" && r.status !== "stream") continue;
+        running = true;
+        const el = r.el.querySelector(".elapsed");
+        if (el) el.textContent = clock(elapsed(r));
+      }
+      if (!running) { clearInterval(ticker); ticker = 0; }
+    }, 1000);
   }
 
   // Batch DOM updates per animation frame.
@@ -667,7 +711,9 @@
   function handleEvent(ev) {
     const r = state.results[ev.page];
     if (ev.type === "page_start") {
+      r.t0 = performance.now();
       setStatus(r, "run", "קורא את הדף…");
+      startTicker();
     } else if (ev.type === "delta") {
       if (r.status !== "stream") { setStatus(r, "run", "מתמלל…"); r.status = "stream"; r.el.querySelector(".text").classList.add("streaming"); }
       r.text += ev.text;
@@ -675,7 +721,7 @@
     } else if (ev.type === "page_done") {
       pending.delete(r);
       finalizePage(r);
-      setStatus(r, "ok", "✓ הושלם");
+      setStatus(r, "ok", `✓ הושלם · ${Math.round(elapsed(r))} שניות`);
     } else if (ev.type === "page_error") {
       pending.delete(r);
       finalizePage(r);
@@ -696,6 +742,7 @@
     const fd = new FormData();
     state.items.forEach((x) => fd.append("files", x.file, x.file.name));
     if (state.provider) fd.append("provider", state.provider);
+    fd.append("quality", state.quality);
     buildPages(state.items.length);
     $("results").hidden = false;
     $("results").scrollIntoView({ behavior: "smooth", block: "start" });

@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import io
 import json
+import logging
 import os
 import secrets
 import time
@@ -38,6 +39,9 @@ except ImportError:  # pragma: no cover
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("transcriber")
+
 # ---------------------------------------------------------------- configuration
 APP_USERNAME = os.environ.get("APP_USERNAME", "").strip()
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
@@ -57,6 +61,9 @@ CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "high")
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
 # gemini-4-hydrogen has a free tier; gemini-4-argon is the stronger, paid-only model.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen")
+# Thinking depth: low / medium / high / xhigh. Higher = slower, sometimes more accurate.
+GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "medium").strip().upper()
+GEMINI_TIMEOUT_S = int(os.environ.get("GEMINI_TIMEOUT_S", "300"))
 
 PROVIDER_LABELS = {"gemini": "Gemini", "claude": "Claude"}
 PROVIDERS = [p for p, key in (("gemini", GEMINI_API_KEY), ("claude", ANTHROPIC_API_KEY)) if key]
@@ -64,6 +71,13 @@ _wanted_default = os.environ.get("DEFAULT_PROVIDER", "").strip().lower()
 DEFAULT_PROVIDER = (
     _wanted_default if _wanted_default in PROVIDERS else (PROVIDERS[0] if PROVIDERS else "gemini")
 )
+
+# UI speed/accuracy choice -> thinking depth per engine.
+QUALITY_LEVELS = {
+    "fast": {"gemini": "LOW", "claude": "low"},
+    "balanced": {"gemini": "MEDIUM", "claude": "medium"},
+    "precise": {"gemini": "HIGH", "claude": "high"},
+}
 
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "4"))
 MAX_FILES = int(os.environ.get("MAX_FILES", "40"))
@@ -189,11 +203,15 @@ async def prepare_input(data: bytes) -> tuple[str, bytes, str]:
     return "image/jpeg", jpeg, IMAGE_INSTRUCTION
 
 
-async def transcribe_page(data: bytes, provider: str):
+async def transcribe_page(data: bytes, provider: str, quality: str = ""):
     """Async generator yielding transcription text chunks for one file."""
     mime, payload, instruction = await prepare_input(data)
-    stream = claude_stream if provider == "claude" else gemini_stream
-    async for chunk in stream(mime, payload, instruction):
+    level = QUALITY_LEVELS.get(quality, {}).get(provider)
+    if provider == "claude":
+        stream = claude_stream(mime, payload, instruction, effort=level or CLAUDE_EFFORT)
+    else:
+        stream = gemini_stream(mime, payload, instruction, thinking=level or GEMINI_THINKING)
+    async for chunk in stream:
         yield chunk
 
 
@@ -206,7 +224,7 @@ def get_claude() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(max_retries=4)
 
 
-async def claude_stream(mime: str, payload: bytes, instruction: str):
+async def claude_stream(mime: str, payload: bytes, instruction: str, effort: str):
     source = {"type": "base64", "media_type": mime, "data": base64.standard_b64encode(payload).decode()}
     block = {"type": "document" if mime == "application/pdf" else "image", "source": source}
 
@@ -214,7 +232,7 @@ async def claude_stream(mime: str, payload: bytes, instruction: str):
         model=CLAUDE_MODEL,
         max_tokens=64000,
         thinking={"type": "adaptive"},
-        output_config={"effort": CLAUDE_EFFORT},
+        output_config={"effort": effort},
         # If a safety classifier declines, the API retries on a suitable model.
         betas=["server-side-fallback-2026-07-01"],
         fallbacks="default",
@@ -225,6 +243,10 @@ async def claude_stream(mime: str, payload: bytes, instruction: str):
             yield text
         final = await stream.get_final_message()
 
+    log.info(
+        "claude %s effort=%s stop=%s tokens: input=%s output=%s",
+        final.model, effort, final.stop_reason, final.usage.input_tokens, final.usage.output_tokens,
+    )
     if final.stop_reason == "refusal":
         raise TranscriptionError("המודל סירב לתמלל את הדף")
     if final.stop_reason == "max_tokens":
@@ -237,7 +259,8 @@ def get_gemini() -> genai.Client:
     retry = genai_types.HttpRetryOptions(
         attempts=4, initial_delay=2.0, max_delay=30.0, http_status_codes=[429, 500, 502, 503, 504]
     )
-    return genai.Client(api_key=GEMINI_API_KEY, http_options=genai_types.HttpOptions(retry_options=retry))
+    http = genai_types.HttpOptions(retry_options=retry, timeout=GEMINI_TIMEOUT_S * 1000)
+    return genai.Client(api_key=GEMINI_API_KEY, http_options=http)
 
 
 _GEMINI_BLOCKED = {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "IMAGE_SAFETY", "OTHER"}
@@ -255,7 +278,7 @@ async def available_gemini_models() -> list[str]:
     return names
 
 
-async def gemini_stream(mime: str, payload: bytes, instruction: str):
+async def gemini_stream(mime: str, payload: bytes, instruction: str, thinking: str):
     # Small handwriting needs the high-detail encoding (set per media item on Gemini 4).
     media = genai_types.Part.from_bytes(
         data=payload,
@@ -266,7 +289,12 @@ async def gemini_stream(mime: str, payload: bytes, instruction: str):
         stream = await get_gemini().aio.models.generate_content_stream(
             model=GEMINI_MODEL,
             contents=[media, instruction],
-            config=genai_types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                thinking_config=(
+                    genai_types.ThinkingConfig(thinking_level=thinking) if thinking else None
+                ),
+            ),
         )
     except genai_errors.ClientError as exc:
         if exc.code == 404:
@@ -274,8 +302,9 @@ async def gemini_stream(mime: str, payload: bytes, instruction: str):
             hint = f" מודלים זמינים: {', '.join(names[:12])}" if names else ""
             raise TranscriptionError(f"המודל {GEMINI_MODEL} לא נמצא. עדכנו את GEMINI_MODEL ב-.env.{hint}") from exc
         raise
-    finish = None
+    finish, usage = None, None
     async for chunk in stream:
+        usage = chunk.usage_metadata or usage
         feedback = chunk.prompt_feedback
         if feedback and feedback.block_reason:
             raise TranscriptionError("Gemini חסם את הבקשה")
@@ -284,6 +313,12 @@ async def gemini_stream(mime: str, payload: bytes, instruction: str):
         if chunk.text:
             yield chunk.text
 
+    if usage:
+        log.info(
+            "gemini %s thinking=%s finish=%s tokens: prompt=%s thinking=%s output=%s",
+            GEMINI_MODEL, thinking, finish, usage.prompt_token_count, usage.thoughts_token_count,
+            usage.candidates_token_count,
+        )
     if finish == "RECITATION":
         raise TranscriptionError("Gemini עצר באמצע (RECITATION). נסו שוב, או תמללו את הדף עם Claude")
     if finish in _GEMINI_BLOCKED:
@@ -404,7 +439,9 @@ async def config():
 
 
 @app.post("/api/transcribe")
-async def transcribe(files: list[UploadFile] = File(...), provider: str = Form("")):
+async def transcribe(
+    files: list[UploadFile] = File(...), provider: str = Form(""), quality: str = Form("")
+):
     if not PROVIDERS:
         raise HTTPException(503, "לא הוגדר מפתח API. הוסיפו GEMINI_API_KEY או ANTHROPIC_API_KEY לקובץ .env")
     provider = provider if provider in PROVIDERS else DEFAULT_PROVIDER
@@ -429,11 +466,22 @@ async def transcribe(files: list[UploadFile] = File(...), provider: str = Form("
         async def work(index: int, data: bytes):
             async with limiter:
                 await queue.put({"type": "page_start", "page": index})
+                started, first = time.monotonic(), None
                 try:
-                    async for chunk in transcribe_page(data, provider):
+                    async for chunk in transcribe_page(data, provider, quality):
+                        if first is None:
+                            first = time.monotonic() - started
                         await queue.put({"type": "delta", "page": index, "text": chunk})
                     await queue.put({"type": "page_done", "page": index})
+                    log.info(
+                        "page %d done via %s: first text after %.1fs, total %.1fs",
+                        index + 1, provider, first or 0, time.monotonic() - started,
+                    )
                 except Exception as exc:  # report per page, keep the others going
+                    log.warning(
+                        "page %d failed via %s after %.1fs: %r",
+                        index + 1, provider, time.monotonic() - started, exc,
+                    )
                     await queue.put(
                         {"type": "page_error", "page": index, "message": friendly_error(exc)}
                     )
@@ -447,7 +495,14 @@ async def transcribe(files: list[UploadFile] = File(...), provider: str = Form("
         finisher = asyncio.create_task(finish())
         try:
             yield ": start\n\n"
-            while (item := await queue.get()) is not None:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"  # keeps proxies from closing a quiet connection
+                    continue
+                if item is None:
+                    break
                 yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
             yield 'data: {"type": "done"}\n\n'
         finally:  # client went away -> stop paying for the remaining pages
