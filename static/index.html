@@ -159,6 +159,16 @@
   .thumb:hover .rm, .thumb:focus-within .rm { opacity: 1; }
   @media (hover: none) { .thumb .rm { opacity: 1; } }
 
+  /* ---------- engine picker ---------- */
+  .engine { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .engine > span { font-size: 14px; color: var(--muted); font-weight: 600; }
+  .seg { display: inline-flex; padding: 3px; border-radius: 12px; background: var(--surface); border: 1px solid var(--line); }
+  .seg button {
+    border: 0; background: none; height: 34px; padding: 0 16px; border-radius: 9px;
+    font-size: 14px; font-weight: 600; color: var(--muted); transition: .15s;
+  }
+  .seg button[aria-pressed="true"] { background: var(--primary); color: var(--on-primary); }
+
   /* ---------- results ---------- */
   .results { margin-top: 40px; }
   .results-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
@@ -309,6 +319,10 @@
         <button class="link" id="clearBtn" type="button">ניקוי</button>
       </div>
       <ol id="thumbs" class="thumbs"></ol>
+      <div class="engine" id="engine" hidden>
+        <span>מנוע זיהוי</span>
+        <div class="seg" id="engineSeg" role="group" aria-label="מנוע זיהוי"></div>
+      </div>
       <button class="btn primary wide" id="goBtn" type="button">תמלול</button>
     </div>
 
@@ -386,6 +400,35 @@
     $("appView").hidden = view !== "app";
     $("logoutBtn").hidden = view !== "app";
     if (view === "login") setTimeout(() => $("username").focus(), 50);
+    if (view === "app") loadConfig();
+  }
+
+  // ---------------------------------------------------------- engine (Claude / Gemini)
+  state.provider = "";
+  async function loadConfig() {
+    try {
+      const r = await fetch("/api/config", { credentials: "same-origin" });
+      if (!r.ok) return;
+      const { providers, default: def } = await r.json();
+      const saved = localStorage.getItem("provider");
+      state.provider = providers.some((p) => p.id === saved) ? saved : def;
+      const seg = $("engineSeg");
+      seg.innerHTML = "";
+      providers.forEach((p) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = p.label;
+        b.title = p.model;
+        b.setAttribute("aria-pressed", String(p.id === state.provider));
+        b.addEventListener("click", () => {
+          state.provider = p.id;
+          localStorage.setItem("provider", p.id);
+          seg.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+        });
+        seg.appendChild(b);
+      });
+      $("engine").hidden = providers.length < 2;
+    } catch {}
   }
 
   $("loginForm").addEventListener("submit", async (e) => {
@@ -652,6 +695,7 @@
 
     const fd = new FormData();
     state.items.forEach((x) => fd.append("files", x.file, x.file.name));
+    if (state.provider) fd.append("provider", state.provider);
     buildPages(state.items.length);
     $("results").hidden = false;
     $("results").scrollIntoView({ behavior: "smooth", block: "start" });

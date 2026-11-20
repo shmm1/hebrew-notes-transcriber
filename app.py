@@ -1,7 +1,7 @@
 """Hebrew handwriting -> typed text.
 
 FastAPI backend: receives page photos / scans / PDFs, prepares them, and streams a
-faithful transcription from Claude's vision model back to the browser (SSE).
+faithful transcription from a vision model (Claude or Gemini) back to the browser (SSE).
 Access is protected by a single username/password taken from environment variables.
 """
 
@@ -22,7 +22,10 @@ from pathlib import Path
 
 import anthropic
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -47,8 +50,21 @@ COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
 SESSION_SECONDS = int(os.environ.get("SESSION_DAYS", "30")) * 86400
 COOKIE_NAME = "hw_session"
 
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
-EFFORT = os.environ.get("CLAUDE_EFFORT", "high")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
+CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "high")
+
+GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+# "gemini-flash-latest" is Google's alias for the newest Flash model (has a free tier).
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+
+PROVIDER_LABELS = {"gemini": "Gemini", "claude": "Claude"}
+PROVIDERS = [p for p, key in (("gemini", GEMINI_API_KEY), ("claude", ANTHROPIC_API_KEY)) if key]
+_wanted_default = os.environ.get("DEFAULT_PROVIDER", "").strip().lower()
+DEFAULT_PROVIDER = (
+    _wanted_default if _wanted_default in PROVIDERS else (PROVIDERS[0] if PROVIDERS else "gemini")
+)
+
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "4"))
 MAX_FILES = int(os.environ.get("MAX_FILES", "40"))
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "30")) * 1024 * 1024
@@ -157,58 +173,53 @@ def prepare_image(data: bytes) -> bytes:
     return buf.getvalue()
 
 
-# ---------------------------------------------------------------- Claude
+# ---------------------------------------------------------------- transcription
 class TranscriptionError(Exception):
     pass
 
 
+async def prepare_input(data: bytes) -> tuple[str, bytes, str]:
+    """Return (mime_type, bytes, instruction) for one uploaded file."""
+    if data[:5] == b"%PDF-":
+        return "application/pdf", data, PDF_INSTRUCTION
+    try:
+        jpeg = await asyncio.to_thread(prepare_image, data)
+    except (UnidentifiedImageError, OSError) as exc:
+        raise TranscriptionError("הקובץ אינו תמונה או PDF תקינים") from exc
+    return "image/jpeg", jpeg, IMAGE_INSTRUCTION
+
+
+async def transcribe_page(data: bytes, provider: str):
+    """Async generator yielding transcription text chunks for one file."""
+    mime, payload, instruction = await prepare_input(data)
+    stream = claude_stream if provider == "claude" else gemini_stream
+    async for chunk in stream(mime, payload, instruction):
+        yield chunk
+
+
+TRUNCATED_NOTE = "\n\n[התמלול נקטע - המסמך ארוך מדי. פצלו אותו לקבצים קטנים יותר]"
+
+
+# ---- Claude
 @lru_cache(maxsize=1)
-def get_client() -> anthropic.AsyncAnthropic:
+def get_claude() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(max_retries=4)
 
 
-async def transcribe_page(data: bytes):
-    """Async generator yielding transcription text chunks for one file."""
-    if data[:5] == b"%PDF-":
-        block = {
-            "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": "application/pdf",
-                "data": base64.standard_b64encode(data).decode(),
-            },
-        }
-        instruction = PDF_INSTRUCTION
-    else:
-        try:
-            jpeg = await asyncio.to_thread(prepare_image, data)
-        except (UnidentifiedImageError, OSError) as exc:
-            raise TranscriptionError("הקובץ אינו תמונה או PDF תקינים") from exc
-        block = {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/jpeg",
-                "data": base64.standard_b64encode(jpeg).decode(),
-            },
-        }
-        instruction = IMAGE_INSTRUCTION
+async def claude_stream(mime: str, payload: bytes, instruction: str):
+    source = {"type": "base64", "media_type": mime, "data": base64.standard_b64encode(payload).decode()}
+    block = {"type": "document" if mime == "application/pdf" else "image", "source": source}
 
-    async with get_client().beta.messages.stream(
-        model=MODEL,
+    async with get_claude().beta.messages.stream(
+        model=CLAUDE_MODEL,
         max_tokens=64000,
         thinking={"type": "adaptive"},
-        output_config={"effort": EFFORT},
+        output_config={"effort": CLAUDE_EFFORT},
         # If a safety classifier declines, the API retries on a suitable model.
         betas=["server-side-fallback-2026-07-01"],
         fallbacks="default",
         system=SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": [block, {"type": "text", "text": instruction}],
-            }
-        ],
+        messages=[{"role": "user", "content": [block, {"type": "text", "text": instruction}]}],
     ) as stream:
         async for text in stream.text_stream:
             yield text
@@ -217,24 +228,78 @@ async def transcribe_page(data: bytes):
     if final.stop_reason == "refusal":
         raise TranscriptionError("המודל סירב לתמלל את הדף")
     if final.stop_reason == "max_tokens":
-        yield "\n\n[התמלול נקטע - המסמך ארוך מדי. פצלו אותו לקבצים קטנים יותר]"
+        yield TRUNCATED_NOTE
+
+
+# ---- Gemini
+@lru_cache(maxsize=1)
+def get_gemini() -> genai.Client:
+    retry = genai_types.HttpRetryOptions(
+        attempts=4, initial_delay=2.0, max_delay=30.0, http_status_codes=[429, 500, 502, 503, 504]
+    )
+    return genai.Client(api_key=GEMINI_API_KEY, http_options=genai_types.HttpOptions(retry_options=retry))
+
+
+_GEMINI_BLOCKED = {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "IMAGE_SAFETY", "OTHER"}
+
+
+async def gemini_stream(mime: str, payload: bytes, instruction: str):
+    config = genai_types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        # Small handwriting needs the high-detail image encoding.
+        media_resolution=genai_types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+    )
+    stream = await get_gemini().aio.models.generate_content_stream(
+        model=GEMINI_MODEL,
+        contents=[genai_types.Part.from_bytes(data=payload, mime_type=mime), instruction],
+        config=config,
+    )
+    finish = None
+    async for chunk in stream:
+        feedback = chunk.prompt_feedback
+        if feedback and feedback.block_reason:
+            raise TranscriptionError("Gemini חסם את הבקשה")
+        if chunk.candidates and chunk.candidates[0].finish_reason:
+            finish = chunk.candidates[0].finish_reason.name
+        if chunk.text:
+            yield chunk.text
+
+    if finish == "RECITATION":
+        raise TranscriptionError("Gemini עצר באמצע (RECITATION). נסו שוב, או תמללו את הדף עם Claude")
+    if finish in _GEMINI_BLOCKED:
+        raise TranscriptionError(f"Gemini עצר את התמלול ({finish})")
+    if finish == "MAX_TOKENS":
+        yield TRUNCATED_NOTE
 
 
 def friendly_error(exc: Exception) -> str:
     if isinstance(exc, TranscriptionError):
         return str(exc)
+    # Claude
     if isinstance(exc, anthropic.AuthenticationError):
         return "מפתח ה-API של Anthropic חסר או שגוי (ANTHROPIC_API_KEY)"
     if isinstance(exc, anthropic.PermissionDeniedError):
-        return "למפתח ה-API אין הרשאה למודל הזה"
+        return "למפתח ה-API של Anthropic אין הרשאה למודל הזה"
     if isinstance(exc, anthropic.RateLimitError):
-        return "עומס זמני על השירות - נסו שוב בעוד דקה"
+        return "עומס זמני על Claude - נסו שוב בעוד דקה"
     if isinstance(exc, anthropic.BadRequestError):
-        return f"הבקשה נדחתה: {exc.message}"
+        return f"Claude דחה את הבקשה: {exc.message}"
     if isinstance(exc, anthropic.APIStatusError):
-        return f"שגיאה בשירות התמלול ({exc.status_code}) - נסו שוב"
+        return f"שגיאה בשירות של Claude ({exc.status_code}) - נסו שוב"
     if isinstance(exc, anthropic.APIConnectionError):
-        return "אין חיבור לשירות התמלול"
+        return "אין חיבור לשירות של Claude"
+    # Gemini
+    if isinstance(exc, genai_errors.APIError):
+        message = exc.message or ""
+        if exc.code == 429:
+            return "חרגתם ממכסת Gemini (בחינם יש מגבלה לדקה וליום). נסו שוב מאוחר יותר"
+        if exc.code in (401, 403) or "API key" in message:
+            return "מפתח ה-API של Gemini חסר או שגוי (GEMINI_API_KEY)"
+        if exc.code == 404:
+            return f"המודל {GEMINI_MODEL} לא נמצא. בדקו את GEMINI_MODEL"
+        if exc.code and exc.code >= 500:
+            return f"שגיאה בשירות של Gemini ({exc.code}) - נסו שוב"
+        return f"Gemini דחה את הבקשה: {message}"
     if isinstance(exc, anthropic.AnthropicError) and "auth" in str(exc).lower():
         return "מפתח ה-API של Anthropic חסר (ANTHROPIC_API_KEY)"
     return "שגיאה לא צפויה בתמלול"
@@ -309,8 +374,20 @@ async def logout():
     return response
 
 
+@app.get("/api/config")
+async def config():
+    models = {"claude": CLAUDE_MODEL, "gemini": GEMINI_MODEL}
+    return {
+        "providers": [{"id": p, "label": PROVIDER_LABELS[p], "model": models[p]} for p in PROVIDERS],
+        "default": DEFAULT_PROVIDER,
+    }
+
+
 @app.post("/api/transcribe")
-async def transcribe(files: list[UploadFile] = File(...)):
+async def transcribe(files: list[UploadFile] = File(...), provider: str = Form("")):
+    if not PROVIDERS:
+        raise HTTPException(503, "לא הוגדר מפתח API. הוסיפו GEMINI_API_KEY או ANTHROPIC_API_KEY לקובץ .env")
+    provider = provider if provider in PROVIDERS else DEFAULT_PROVIDER
     if not files:
         raise HTTPException(400, "לא נבחרו קבצים")
     if len(files) > MAX_FILES:
@@ -333,7 +410,7 @@ async def transcribe(files: list[UploadFile] = File(...)):
             async with limiter:
                 await queue.put({"type": "page_start", "page": index})
                 try:
-                    async for chunk in transcribe_page(data):
+                    async for chunk in transcribe_page(data, provider):
                         await queue.put({"type": "delta", "page": index, "text": chunk})
                     await queue.put({"type": "page_done", "page": index})
                 except Exception as exc:  # report per page, keep the others going
