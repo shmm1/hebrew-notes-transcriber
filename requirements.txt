@@ -1,0 +1,7 @@
+anthropic>=2.11,<3
+fastapi>=0.165,<1
+uvicorn[standard]>=0.54,<1
+python-multipart>=0.0.34
+pillow>=13.0
+pillow-heif>=1.8
+python-dotenv>=1.2
